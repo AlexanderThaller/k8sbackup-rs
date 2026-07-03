@@ -1,18 +1,42 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use anyhow::{
+    Context,
+    Result,
+    anyhow,
+    bail,
+};
+use clap::{
+    Parser,
+    ValueEnum,
+};
 use kube::{
-    Api, Client, ResourceExt,
-    api::{DynamicObject, ListParams},
-    discovery::{ApiCapabilities, ApiResource, Discovery, Scope, verbs},
+    Api,
+    Client,
+    ResourceExt,
+    api::{
+        DynamicObject,
+        ListParams,
+    },
+    discovery::{
+        ApiCapabilities,
+        ApiResource,
+        Discovery,
+        Scope,
+        verbs,
+    },
 };
 use serde_json::Value;
 
 const GLOBAL_NAMESPACE: &str = "_global";
+const RESTIC_SNAPSHOT_PATH: &str = "k8sbackup";
+const RESTIC_TAG: &str = "k8sbackup";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,20 +44,71 @@ const GLOBAL_NAMESPACE: &str = "_global";
     about = "Dump Kubernetes objects to restore-friendly YAML files"
 )]
 struct Args {
-    /// Output directory for the backup
+    /// Backup destination type.
+    #[arg(long = "backup-type", value_enum, default_value = "folder")]
+    backup_type: BackupType,
+
+    /// Output directory for `--backup-type folder`.
     #[arg(short, long, default_value = "backup")]
     output: PathBuf,
+
+    /// Restic repository destination for `--backup-type restic`.
+    #[arg(
+        long = "restic-repository",
+        env = "K8SBACKUP_RESTIC_REPOSITORY",
+        value_name = "REPOSITORY",
+        required_if_eq("backup_type", "restic")
+    )]
+    restic_repository: Option<String>,
+
+    /// Restic repository password.
+    ///
+    /// Falls back to `K8SBACKUP_RESTIC_PASSWORD`, then `RESTIC_PASSWORD`.
+    #[arg(
+        long = "restic-password",
+        env = "K8SBACKUP_RESTIC_PASSWORD",
+        hide_env_values = true
+    )]
+    restic_password: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BackupType {
+    Folder,
+    Restic,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let args = Args::parse();
-    fs::create_dir_all(&args.output)
-        .with_context(|| format!("creating output directory {}", args.output.display()))?;
 
     let client = Client::try_default()
         .await
         .context("creating Kubernetes client from local kubeconfig or in-cluster config")?;
+
+    match args.backup_type {
+        BackupType::Folder => {
+            let written = dump_cluster(&client, &args.output).await?;
+            println!("wrote {written} object(s) to {}", args.output.display());
+        }
+        BackupType::Restic => {
+            let repository = args.restic_repository.as_deref().ok_or_else(|| {
+                anyhow!("--restic-repository is required for --backup-type restic")
+            })?;
+            let password = restic_password(args.restic_password)?;
+            let written = write_restic_backup(&client, repository, password).await?;
+            println!("wrote {written} object(s) to restic repository {repository}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn dump_cluster(client: &Client, output: &Path) -> Result<usize> {
+    fs::create_dir_all(output)
+        .with_context(|| format!("creating output directory {}", output.display()))?;
 
     let discovery = Discovery::new(client.clone())
         .run()
@@ -49,7 +124,7 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            match dump_resource(&client, &resource, &capabilities, &args.output).await {
+            match dump_resource(client, &resource, &capabilities, output).await {
                 Ok(count) => written += count,
                 Err(err) => {
                     failures.push(format!(
@@ -61,8 +136,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!("wrote {written} object(s) to {}", args.output.display());
-
     if !failures.is_empty() {
         eprintln!("failed to dump {} resource type(s):", failures.len());
         for failure in failures {
@@ -71,13 +144,101 @@ async fn main() -> Result<()> {
         bail!("backup completed with errors");
     }
 
-    Ok(())
+    Ok(written)
 }
 
 fn should_skip_resource(resource: &ApiResource, capabilities: &ApiCapabilities) -> bool {
     resource.plural.contains('/')
         || !capabilities.supports_operation(verbs::LIST)
         || !capabilities.supports_operation(verbs::GET)
+}
+
+fn restic_password(password: Option<String>) -> Result<String> {
+    password
+        .or_else(|| std::env::var("K8SBACKUP_RESTIC_PASSWORD").ok())
+        .or_else(|| std::env::var("RESTIC_PASSWORD").ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "--restic-password, K8SBACKUP_RESTIC_PASSWORD, or RESTIC_PASSWORD is required for \
+                 --backup-type restic"
+            )
+        })
+}
+
+async fn write_restic_backup(client: &Client, repository: &str, password: String) -> Result<usize> {
+    let staging = std::env::temp_dir().join(format!("k8sbackup-{}", uuid::Uuid::now_v7()));
+
+    let result = async {
+        let written = dump_cluster(client, &staging).await?;
+        let source = staging.clone();
+        let repository = repository.to_string();
+
+        tokio::task::spawn_blocking(move || run_rustic_backup(&source, &repository, password))
+            .await
+            .context("restic backup task failed")??;
+
+        Ok(written)
+    }
+    .await;
+
+    if let Err(err) = fs::remove_dir_all(&staging) {
+        eprintln!(
+            "warning: failed to remove temporary backup staging directory {}: {err}",
+            staging.display()
+        );
+    }
+
+    result
+}
+
+fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Result<()> {
+    use rustic_backend::BackendOptions;
+    use rustic_core::{
+        BackupOptions,
+        CheckOptions,
+        ConfigOptions,
+        Credentials,
+        KeyOptions,
+        PathList,
+        Repository,
+        RepositoryOptions,
+        SnapshotOptions,
+    };
+
+    let credentials = Credentials::Password(password);
+    let repo_opts = RepositoryOptions::default();
+    let backends = BackendOptions::default()
+        .repository(repository)
+        .to_backends()?;
+    let repo = Repository::new(&repo_opts, &backends)?;
+    let repo = match repo.open(&credentials) {
+        Ok(repo) => repo,
+        Err(_) => Repository::new(&repo_opts, &backends)?.init(
+            &credentials,
+            &KeyOptions::default(),
+            &ConfigOptions::default(),
+        )?,
+    };
+    let repo = repo.to_indexed_ids()?;
+
+    let mut backup_opts = BackupOptions::default();
+    backup_opts.as_path = Some(PathBuf::from(RESTIC_SNAPSHOT_PATH));
+    let source = source
+        .to_str()
+        .ok_or_else(|| anyhow!("backup staging path is not valid UTF-8"))?;
+    let source = PathList::from_string(source)?.sanitize()?;
+    let snapshot = SnapshotOptions::default()
+        .add_tags(RESTIC_TAG)?
+        .to_snapshot()?;
+    let snapshot = repo.backup(&backup_opts, &source, snapshot)?;
+    println!("created restic snapshot {}", snapshot.id);
+
+    let check_opts = CheckOptions::default().read_data(true);
+    let results = repo.check(check_opts)?;
+    results.is_ok()?;
+    println!("checked repository");
+
+    Ok(())
 }
 
 async fn dump_resource(
