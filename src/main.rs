@@ -24,6 +24,7 @@ use kube::{
         DynamicObject,
         ListParams,
     },
+    core::TypeMeta,
     discovery::{
         ApiCapabilities,
         ApiResource,
@@ -32,8 +33,6 @@ use kube::{
         verbs,
     },
 };
-use serde_json::Value;
-
 const GLOBAL_NAMESPACE: &str = "_global";
 const RESTIC_SNAPSHOT_PATH: &str = "k8sbackup";
 const RESTIC_TAG: &str = "k8sbackup";
@@ -254,7 +253,9 @@ async fn dump_resource(
         .with_context(|| format!("listing {}", resource.plural))?;
 
     let mut count = 0usize;
-    for object in objects {
+    for mut object in objects {
+        ensure_type_meta(&mut object, resource);
+
         let namespace = match capabilities.scope {
             Scope::Cluster => GLOBAL_NAMESPACE.to_string(),
             Scope::Namespaced => object.namespace().ok_or_else(|| {
@@ -273,52 +274,30 @@ async fn dump_resource(
             .join(resource_dir)
             .join(filename);
 
-        write_object(&path, object).with_context(|| format!("writing {}", path.display()))?;
+        write_object(&path, &object).with_context(|| format!("writing {}", path.display()))?;
         count += 1;
     }
 
     Ok(count)
 }
 
-fn write_object(path: &Path, object: DynamicObject) -> Result<()> {
+fn write_object(path: &Path, object: &DynamicObject) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
 
-    let mut value = serde_json::to_value(object)?;
-    clean_for_restore(&mut value);
-
-    let yaml = serde_yaml::to_string(&value)?;
+    let yaml = serde_yaml::to_string(object)?;
     fs::write(path, yaml)?;
 
     Ok(())
 }
 
-fn clean_for_restore(value: &mut Value) {
-    let Value::Object(object) = value else {
-        return;
-    };
-
-    object.remove("status");
-
-    let Some(Value::Object(metadata)) = object.get_mut("metadata") else {
-        return;
-    };
-
-    for key in [
-        "creationTimestamp",
-        "deletionGracePeriodSeconds",
-        "deletionTimestamp",
-        "generation",
-        "managedFields",
-        "ownerReferences",
-        "resourceVersion",
-        "selfLink",
-        "uid",
-    ] {
-        metadata.remove(key);
-    }
+fn ensure_type_meta(object: &mut DynamicObject, resource: &ApiResource) {
+    object.types.get_or_insert_with(|| TypeMeta {
+        api_version: resource.api_version.clone(),
+        kind: resource.kind.clone(),
+    });
 }
 
 fn safe_path_segment(value: &str) -> String {
@@ -329,4 +308,140 @@ fn safe_path_segment(value: &str) -> String {
             _ => '_',
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use kube::core::{
+        ObjectMeta,
+        TypeMeta,
+    };
+    use serde_json::{
+        Value,
+        json,
+    };
+
+    #[test]
+    fn ensure_type_meta_adds_missing_api_version_and_kind() {
+        let resource = ApiResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            api_version: "apps/v1".to_string(),
+            kind: "Deployment".to_string(),
+            plural: "deployments".to_string(),
+        };
+        let mut object = DynamicObject {
+            types: None,
+            metadata: ObjectMeta {
+                name: Some("example".to_string()),
+                ..Default::default()
+            },
+            data: json!({
+                "spec": {
+                    "replicas": 1,
+                },
+            }),
+        };
+
+        ensure_type_meta(&mut object, &resource);
+
+        assert_eq!(
+            object.types,
+            Some(TypeMeta {
+                api_version: "apps/v1".to_string(),
+                kind: "Deployment".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn ensure_type_meta_preserves_existing_api_version_and_kind() {
+        let resource = ApiResource {
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            api_version: "apps/v1".to_string(),
+            kind: "Deployment".to_string(),
+            plural: "deployments".to_string(),
+        };
+        let mut object = DynamicObject {
+            types: Some(TypeMeta {
+                api_version: "custom/v1".to_string(),
+                kind: "Custom".to_string(),
+            }),
+            metadata: ObjectMeta {
+                name: Some("example".to_string()),
+                ..Default::default()
+            },
+            data: json!({}),
+        };
+
+        ensure_type_meta(&mut object, &resource);
+
+        assert_eq!(
+            object.types,
+            Some(TypeMeta {
+                api_version: "custom/v1".to_string(),
+                kind: "Custom".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn write_object_preserves_complete_object() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("k8sbackup-rs-{}.yaml", uuid::Uuid::now_v7()));
+        let object = DynamicObject {
+            types: Some(TypeMeta {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+            }),
+            metadata: ObjectMeta {
+                name: Some("example".to_string()),
+                namespace: Some("default".to_string()),
+                resource_version: Some("12345".to_string()),
+                uid: Some("abcde".to_string()),
+                ..Default::default()
+            },
+            data: json!({
+                "spec": {
+                    "containers": [{
+                        "name": "example",
+                        "image": "alpine",
+                    }],
+                },
+                "status": {
+                    "phase": "Running",
+                },
+            }),
+        };
+
+        write_object(&path, &object)?;
+
+        let yaml = fs::read_to_string(&path)?;
+        let written: Value = serde_yaml::from_str(&yaml)?;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            written.get("apiVersion").and_then(Value::as_str),
+            Some("v1")
+        );
+        assert_eq!(written.get("kind").and_then(Value::as_str), Some("Pod"));
+        assert_eq!(
+            written
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str),
+            Some("12345")
+        );
+        assert_eq!(
+            written.pointer("/metadata/uid").and_then(Value::as_str),
+            Some("abcde")
+        );
+        assert_eq!(
+            written.pointer("/status/phase").and_then(Value::as_str),
+            Some("Running")
+        );
+
+        Ok(())
+    }
 }
