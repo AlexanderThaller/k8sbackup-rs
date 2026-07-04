@@ -101,7 +101,10 @@ async fn main() -> Result<()> {
             })?;
             let password = restic_password(args.restic_password)?;
             let written = write_restic_backup(&client, repository, password).await?;
-            println!("wrote {written} object(s) to restic repository {repository}");
+            println!(
+                "wrote {written} object(s) to restic repository {}",
+                censor_repository_password(repository)
+            );
         }
     }
 
@@ -337,6 +340,35 @@ fn safe_path_segment(value: &str) -> String {
         .collect()
 }
 
+fn censor_repository_password(repository: &str) -> String {
+    let Some(authority_start) = repository.find("://").map(|index| index + 3) else {
+        return repository.to_string();
+    };
+
+    let authority = &repository[authority_start..];
+    let authority_end = authority
+        .find(['/', '?', '#'])
+        .map_or(repository.len(), |index| authority_start + index);
+    let authority = &repository[authority_start..authority_end];
+
+    let Some(at_index) = authority.rfind('@') else {
+        return repository.to_string();
+    };
+    let userinfo = &authority[..at_index];
+    let Some(password_start) = userinfo.find(':') else {
+        return repository.to_string();
+    };
+
+    let password_start = authority_start + password_start + 1;
+    let password_end = authority_start + at_index;
+
+    format!(
+        "{}***{}",
+        &repository[..password_start],
+        &repository[password_end..]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +445,24 @@ mod tests {
                 kind: "Custom".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn censor_repository_password_masks_rest_backend_password() {
+        let repository =
+            "rest:https://imap-chatbot-k8sbackup:secret@restic.thaller.ws/imap-chatbot-k8sbackup";
+
+        assert_eq!(
+            censor_repository_password(repository),
+            "rest:https://imap-chatbot-k8sbackup:***@restic.thaller.ws/imap-chatbot-k8sbackup"
+        );
+    }
+
+    #[test]
+    fn censor_repository_password_leaves_repository_without_password_unchanged() {
+        let repository = "s3:s3.amazonaws.com/example-bucket";
+
+        assert_eq!(censor_repository_password(repository), repository);
     }
 
     #[test]
