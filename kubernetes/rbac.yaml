@@ -1,0 +1,38 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8sbackup
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8sbackup
+rules:
+  - apiGroups:
+      - "*"
+    resources:
+      - "*"
+    verbs:
+      - get
+      - list
+  - nonResourceURLs:
+      - /api
+      - /api/*
+      - /apis
+      - /apis/*
+      - /version
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8sbackup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k8sbackup
+subjects:
+  - kind: ServiceAccount
+    name: k8sbackup
+    namespace: k8sbackup
