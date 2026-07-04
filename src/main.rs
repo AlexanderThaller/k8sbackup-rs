@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::BufWriter,
     path::{
         Path,
         PathBuf,
@@ -34,6 +35,8 @@ use kube::{
     },
 };
 const GLOBAL_NAMESPACE: &str = "_global";
+const KUBERNETES_LIST_PAGE_SIZE: u32 = 100;
+const RESTIC_COMPRESSION_LEVEL: i32 = 1;
 const RESTIC_SNAPSHOT_PATH: &str = "k8sbackup";
 const RESTIC_TAG: &str = "k8sbackup";
 
@@ -209,15 +212,21 @@ fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Resul
     let backends = BackendOptions::default()
         .repository(repository)
         .to_backends()?;
+    let mut config_opts = ConfigOptions::default();
+    config_opts.set_compression = Some(RESTIC_COMPRESSION_LEVEL);
+
     let repo = Repository::new(&repo_opts, &backends)?;
-    let repo = match repo.open(&credentials) {
+    let mut repo = match repo.open(&credentials) {
         Ok(repo) => repo,
         Err(_) => Repository::new(&repo_opts, &backends)?.init(
             &credentials,
             &KeyOptions::default(),
-            &ConfigOptions::default(),
+            &config_opts,
         )?,
     };
+    if repo.apply_config(&config_opts)? {
+        repo = Repository::new(&repo_opts, &backends)?.open(&credentials)?;
+    }
     let repo = repo.to_indexed_ids()?;
 
     let mut backup_opts = BackupOptions::default();
@@ -232,7 +241,7 @@ fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Resul
     let snapshot = repo.backup(&backup_opts, &source, snapshot)?;
     println!("created restic snapshot {}", snapshot.id);
 
-    let check_opts = CheckOptions::default().read_data(true);
+    let check_opts = CheckOptions::default();
     let results = repo.check(check_opts)?;
     results.is_ok()?;
     println!("checked repository");
@@ -247,35 +256,53 @@ async fn dump_resource(
     output: &Path,
 ) -> Result<usize> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), resource);
-    let objects = api
-        .list(&ListParams::default())
-        .await
-        .with_context(|| format!("listing {}", resource.plural))?;
-
+    let mut list_params = ListParams::default().limit(KUBERNETES_LIST_PAGE_SIZE);
     let mut count = 0usize;
-    for mut object in objects {
-        ensure_type_meta(&mut object, resource);
 
-        let namespace = match capabilities.scope {
-            Scope::Cluster => GLOBAL_NAMESPACE.to_string(),
-            Scope::Namespaced => object.namespace().ok_or_else(|| {
-                anyhow!("namespaced object {} had no namespace", object.name_any())
-            })?,
-        };
+    loop {
+        let mut objects = api
+            .list(&list_params)
+            .await
+            .with_context(|| format!("listing {}", resource.plural))?;
+        let continue_token = objects
+            .metadata
+            .continue_
+            .take()
+            .filter(|token| !token.is_empty());
 
-        let filename = format!("{}.yaml", safe_path_segment(&object.name_any()));
-        let resource_dir = format!(
-            "{}-{}",
-            safe_path_segment(&resource.kind),
-            safe_path_segment(&resource.api_version)
-        );
-        let path = output
-            .join(safe_path_segment(&namespace))
-            .join(resource_dir)
-            .join(filename);
+        for mut object in objects {
+            ensure_type_meta(&mut object, resource);
 
-        write_object(&path, &object).with_context(|| format!("writing {}", path.display()))?;
-        count += 1;
+            let namespace = match capabilities.scope {
+                Scope::Cluster => GLOBAL_NAMESPACE.to_string(),
+                Scope::Namespaced => object.namespace().ok_or_else(|| {
+                    anyhow!("namespaced object {} had no namespace", object.name_any())
+                })?,
+            };
+
+            let filename = format!("{}.yaml", safe_path_segment(&object.name_any()));
+            let resource_dir = format!(
+                "{}-{}",
+                safe_path_segment(&resource.kind),
+                safe_path_segment(&resource.api_version)
+            );
+            let path = output
+                .join(safe_path_segment(&namespace))
+                .join(resource_dir)
+                .join(filename);
+
+            write_object(&path, &object).with_context(|| format!("writing {}", path.display()))?;
+            count += 1;
+        }
+
+        match continue_token {
+            Some(token) => {
+                list_params = ListParams::default()
+                    .limit(KUBERNETES_LIST_PAGE_SIZE)
+                    .continue_token(&token);
+            }
+            None => break,
+        }
     }
 
     Ok(count)
@@ -287,8 +314,8 @@ fn write_object(path: &Path, object: &DynamicObject) -> Result<()> {
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
 
-    let yaml = serde_yaml::to_string(object)?;
-    fs::write(path, yaml)?;
+    let file = fs::File::create(path)?;
+    serde_yaml::to_writer(BufWriter::new(file), object)?;
 
     Ok(())
 }
