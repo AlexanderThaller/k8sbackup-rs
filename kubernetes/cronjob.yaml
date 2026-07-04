@@ -16,7 +16,7 @@ spec:
           restartPolicy: Never
           containers:
             - name: k8sbackup
-              image: k8sbackup-rs:latest
+              image: ghcr.io/alexanderthaller/k8sbackup-rs:0.1.1
               imagePullPolicy: IfNotPresent
               args:
                 - --backup-type
