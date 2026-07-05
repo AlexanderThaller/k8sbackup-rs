@@ -12,9 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin the container's time zone to UTC so `jiff` (pulled in transitively via
   `k8s-openapi`/`kube`/`opendal`) no longer logs a spurious `WARN` about
   failing to detect the system time zone in the distroless runtime image.
+- Docker image workflow's tag-push trigger now matches this repo's actual
+  tag naming (`0.1.1`, no `v` prefix); it previously looked for `v*.*.*` and
+  never matched, so pushing a version tag never triggered a build.
 
 ### Added
 
+- Docker images are now also tagged with `git describe --always --tags`
+  (e.g. `0.1.1-3-g1a2b3c4`) on every build, so a specific commit can be
+  pulled without waiting for a release.
 - Structured logging via `tracing`, with start/finish events for the cluster
   dump, each resource type, and the restic backup/check steps. Log level
   defaults to `info` and is configurable with `RUST_LOG`.
