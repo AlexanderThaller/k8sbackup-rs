@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add LICENSE.txt specifying the license as MIT.
 - Crate metadata (`description`, `repository`, `readme`, `keywords`,
   `categories`) required for publishing to crates.io.
+- BuildKit cache mounts for the cargo registry and build target directory in
+  the Docker build, persisted across CI runs with
+  `reproducible-containers/buildkit-cache-dance`, so unchanged dependencies
+  are not recompiled on every image build.
 
 ## [0.1.1] - 2026-07-04
 
