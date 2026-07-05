@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dump, each resource type, and the restic backup/check steps. Log level
   defaults to `info` and is configurable with `RUST_LOG`.
 - Add LICENSE.txt specifying the license as MIT.
+- Crate metadata (`description`, `repository`, `readme`, `keywords`,
+  `categories`) required for publishing to crates.io.
 
 ## [0.1.1] - 2026-07-04
 

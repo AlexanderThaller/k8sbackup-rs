@@ -3,6 +3,11 @@ name = "k8sbackup-rs"
 version = "0.1.1"
 edition = "2024"
 license = "MIT"
+description = "Backs up Kubernetes API objects as restore-friendly YAML files, optionally storing them in a restic-compatible repository."
+repository = "https://github.com/AlexanderThaller/k8sbackup-rs"
+readme = "README.md"
+keywords = ["kubernetes", "backup", "restic", "k8s"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
