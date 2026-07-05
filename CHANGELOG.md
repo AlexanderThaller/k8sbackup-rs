@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pin the container's time zone to UTC so `jiff` (pulled in transitively via
+  `k8s-openapi`/`kube`/`opendal`) no longer logs a spurious `WARN` about
+  failing to detect the system time zone in the distroless runtime image.
+
 ### Added
 
 - Structured logging via `tracing`, with start/finish events for the cluster

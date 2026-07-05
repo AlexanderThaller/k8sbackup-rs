@@ -17,6 +17,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry \
     && cp target/deploy/k8sbackup-rs /tmp/k8sbackup-rs
 
 FROM ${RUNTIME_IMAGE}
+# The distroless image has no /etc/localtime or tzdata, so jiff (pulled in
+# transitively via k8s-openapi/kube/opendal) can't detect the system time
+# zone and logs a WARN on every run. Pin it to UTC to skip that lookup.
+ENV TZ=UTC
 COPY --from=builder /tmp/k8sbackup-rs /usr/local/bin/k8sbackup-rs
 
 ENTRYPOINT ["/usr/local/bin/k8sbackup-rs"]
