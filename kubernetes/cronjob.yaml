@@ -3,7 +3,7 @@ kind: CronJob
 metadata:
   name: k8sbackup
 spec:
-  schedule: "17 2 * * *"
+  schedule: "17 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
