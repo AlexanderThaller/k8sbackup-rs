@@ -80,6 +80,17 @@ Required environment variables:
 The CronJob runs daily at `02:17` in the `k8sbackup` namespace. The image is set
 to `k8sbackup-rs:latest`; override it with kustomize for your registry.
 
+## Logging
+
+`k8sbackup-rs` logs structured, human-readable events (start/finish of the
+cluster dump, each resource type, and the restic backup/check steps) via
+`tracing`. The log level defaults to `info` and can be overridden with the
+`RUST_LOG` environment variable, e.g.:
+
+```sh
+RUST_LOG=debug cargo run -- --backup-type folder --output backup
+```
+
 ## Notes
 
 Restic repository URLs printed by the application are sanitized so embedded

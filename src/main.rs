@@ -34,6 +34,13 @@ use kube::{
         verbs,
     },
 };
+use tracing::{
+    debug,
+    info,
+    instrument,
+    warn,
+};
+use tracing_subscriber::EnvFilter;
 const GLOBAL_NAMESPACE: &str = "_global";
 const KUBERNETES_LIST_PAGE_SIZE: u32 = 100;
 const RESTIC_COMPRESSION_LEVEL: i32 = 1;
@@ -82,9 +89,13 @@ enum BackupType {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let args = Args::parse();
+
+    info!(backup_type = ?args.backup_type, "starting k8sbackup");
 
     let client = Client::try_default()
         .await
@@ -93,7 +104,11 @@ async fn main() -> Result<()> {
     match args.backup_type {
         BackupType::Folder => {
             let written = dump_cluster(&client, &args.output).await?;
-            println!("wrote {written} object(s) to {}", args.output.display());
+            info!(
+                written,
+                output = %args.output.display(),
+                "finished writing backup to folder"
+            );
         }
         BackupType::Restic => {
             let repository = args.restic_repository.as_deref().ok_or_else(|| {
@@ -101,20 +116,36 @@ async fn main() -> Result<()> {
             })?;
             let password = restic_password(args.restic_password)?;
             let written = write_restic_backup(&client, repository, password).await?;
-            println!(
-                "wrote {written} object(s) to restic repository {}",
-                censor_repository_password(repository)
+            info!(
+                written,
+                repository = %censor_repository_password(repository),
+                "finished writing backup to restic repository"
             );
         }
     }
 
+    info!("k8sbackup finished successfully");
+
     Ok(())
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
+#[instrument(skip(client), fields(output = %output.display()))]
 async fn dump_cluster(client: &Client, output: &Path) -> Result<usize> {
+    info!("starting cluster dump");
+
     fs::create_dir_all(output)
         .with_context(|| format!("creating output directory {}", output.display()))?;
 
+    debug!("discovering Kubernetes API resources");
     let discovery = Discovery::new(client.clone())
         .run()
         .await
@@ -132,6 +163,12 @@ async fn dump_cluster(client: &Client, output: &Path) -> Result<usize> {
             match dump_resource(client, &resource, &capabilities, output).await {
                 Ok(count) => written += count,
                 Err(err) => {
+                    warn!(
+                        api_version = %resource.api_version,
+                        kind = %resource.kind,
+                        error = %format!("{err:#}"),
+                        "failed to dump resource type"
+                    );
                     failures.push(format!(
                         "{}/{}: {err:#}",
                         resource.api_version, resource.kind
@@ -142,12 +179,14 @@ async fn dump_cluster(client: &Client, output: &Path) -> Result<usize> {
     }
 
     if !failures.is_empty() {
-        eprintln!("failed to dump {} resource type(s):", failures.len());
-        for failure in failures {
-            eprintln!("  - {failure}");
-        }
-        bail!("backup completed with errors");
+        bail!(
+            "backup completed with errors in {} resource type(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
     }
+
+    info!(written, "finished cluster dump");
 
     Ok(written)
 }
@@ -172,6 +211,13 @@ fn restic_password(password: Option<String>) -> Result<String> {
 
 async fn write_restic_backup(client: &Client, repository: &str, password: String) -> Result<usize> {
     let staging = std::env::temp_dir().join(format!("k8sbackup-{}", uuid::Uuid::now_v7()));
+    let censored_repository = censor_repository_password(repository);
+
+    info!(
+        repository = %censored_repository,
+        staging = %staging.display(),
+        "starting restic backup"
+    );
 
     let result = async {
         let written = dump_cluster(client, &staging).await?;
@@ -186,11 +232,26 @@ async fn write_restic_backup(client: &Client, repository: &str, password: String
     }
     .await;
 
+    debug!(staging = %staging.display(), "removing temporary backup staging directory");
     if let Err(err) = fs::remove_dir_all(&staging) {
-        eprintln!(
-            "warning: failed to remove temporary backup staging directory {}: {err}",
-            staging.display()
+        warn!(
+            staging = %staging.display(),
+            error = %err,
+            "failed to remove temporary backup staging directory"
         );
+    }
+
+    match &result {
+        Ok(written) => info!(
+            written,
+            repository = %censored_repository,
+            "finished restic backup"
+        ),
+        Err(err) => warn!(
+            repository = %censored_repository,
+            error = %format!("{err:#}"),
+            "restic backup failed"
+        ),
     }
 
     result
@@ -218,16 +279,20 @@ fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Resul
     let mut config_opts = ConfigOptions::default();
     config_opts.set_compression = Some(RESTIC_COMPRESSION_LEVEL);
 
+    debug!("opening restic repository");
     let repo = Repository::new(&repo_opts, &backends)?;
-    let mut repo = match repo.open(&credentials) {
-        Ok(repo) => repo,
-        Err(_) => Repository::new(&repo_opts, &backends)?.init(
+    let mut repo = if let Ok(repo) = repo.open(&credentials) {
+        repo
+    } else {
+        info!("restic repository not found, initializing a new one");
+        Repository::new(&repo_opts, &backends)?.init(
             &credentials,
             &KeyOptions::default(),
             &config_opts,
-        )?,
+        )?
     };
     if repo.apply_config(&config_opts)? {
+        debug!("repository config changed, reopening repository");
         repo = Repository::new(&repo_opts, &backends)?.open(&credentials)?;
     }
     let repo = repo.to_indexed_ids()?;
@@ -241,23 +306,32 @@ fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Resul
     let snapshot = SnapshotOptions::default()
         .add_tags(RESTIC_TAG)?
         .to_snapshot()?;
-    let snapshot = repo.backup(&backup_opts, &source, snapshot)?;
-    println!("created restic snapshot {}", snapshot.id);
 
+    info!("starting restic snapshot creation");
+    let snapshot = repo.backup(&backup_opts, &source, snapshot)?;
+    info!(snapshot_id = %snapshot.id, "created restic snapshot");
+
+    info!("starting restic repository check");
     let check_opts = CheckOptions::default();
     let results = repo.check(check_opts)?;
     results.is_ok()?;
-    println!("checked repository");
+    info!("finished restic repository check");
 
     Ok(())
 }
 
+#[instrument(
+    skip(client, capabilities, output),
+    fields(api_version = %resource.api_version, kind = %resource.kind)
+)]
 async fn dump_resource(
     client: &Client,
     resource: &ApiResource,
     capabilities: &ApiCapabilities,
     output: &Path,
 ) -> Result<usize> {
+    debug!("starting resource dump");
+
     let api: Api<DynamicObject> = Api::all_with(client.clone(), resource);
     let mut list_params = ListParams::default().limit(KUBERNETES_LIST_PAGE_SIZE);
     let mut count = 0usize;
@@ -307,6 +381,8 @@ async fn dump_resource(
             None => break,
         }
     }
+
+    debug!(count, "finished resource dump");
 
     Ok(count)
 }
