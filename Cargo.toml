@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v7"] }
 
 [lints.rust]
-#missing-docs = "warn"
+missing-docs = "warn"
 missing-debug-implementations = "warn"
 rust-2018-idioms = "warn"
 unsafe-code = "forbid"

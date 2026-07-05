@@ -1,3 +1,10 @@
+//! `k8sbackup-rs` backs up Kubernetes API objects as restore-friendly YAML
+//! files. It can write the dump to a local folder or stage the dump and store
+//! it in a restic-compatible repository via `rustic`.
+//!
+//! The tool discovers API resources from the current cluster, skips resources
+//! that cannot be listed and fetched, and writes one YAML file per object.
+
 use std::{
     fs,
     io::BufWriter,
