@@ -86,6 +86,17 @@ struct Args {
         hide_env_values = true
     )]
     restic_password: Option<String>,
+
+    /// Host name recorded in the restic snapshot.
+    ///
+    /// Falls back to `K8SBACKUP_RESTIC_HOST`, then `RESTIC_HOST`, then the
+    /// system host name.
+    #[arg(
+        long = "restic-host",
+        env = "K8SBACKUP_RESTIC_HOST",
+        value_name = "NAME"
+    )]
+    restic_host: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -122,7 +133,8 @@ async fn main() -> Result<()> {
                 anyhow!("--restic-repository is required for --backup-type restic")
             })?;
             let password = restic_password(args.restic_password)?;
-            let written = write_restic_backup(&client, repository, password).await?;
+            let host = restic_host(args.restic_host);
+            let written = write_restic_backup(&client, repository, password, host).await?;
             info!(
                 written,
                 repository = %censor_repository_password(repository),
@@ -216,13 +228,25 @@ fn restic_password(password: Option<String>) -> Result<String> {
         })
 }
 
-async fn write_restic_backup(client: &Client, repository: &str, password: String) -> Result<usize> {
+fn restic_host(host: Option<String>) -> Option<String> {
+    host.or_else(|| std::env::var("K8SBACKUP_RESTIC_HOST").ok())
+        .or_else(|| std::env::var("RESTIC_HOST").ok())
+        .filter(|host| !host.is_empty())
+}
+
+async fn write_restic_backup(
+    client: &Client,
+    repository: &str,
+    password: String,
+    host: Option<String>,
+) -> Result<usize> {
     let staging = std::env::temp_dir().join(format!("k8sbackup-{}", uuid::Uuid::now_v7()));
     let censored_repository = censor_repository_password(repository);
 
     info!(
         repository = %censored_repository,
         staging = %staging.display(),
+        host = host.as_deref().unwrap_or("<system host name>"),
         "starting restic backup"
     );
 
@@ -231,9 +255,11 @@ async fn write_restic_backup(client: &Client, repository: &str, password: String
         let source = staging.clone();
         let repository = repository.to_string();
 
-        tokio::task::spawn_blocking(move || run_rustic_backup(&source, &repository, password))
-            .await
-            .context("restic backup task failed")??;
+        tokio::task::spawn_blocking(move || {
+            run_rustic_backup(&source, &repository, password, host)
+        })
+        .await
+        .context("restic backup task failed")??;
 
         Ok(written)
     }
@@ -264,7 +290,12 @@ async fn write_restic_backup(client: &Client, repository: &str, password: String
     result
 }
 
-fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Result<()> {
+fn run_rustic_backup(
+    source: &Path,
+    repository: &str,
+    password: String,
+    host: Option<String>,
+) -> Result<()> {
     use rustic_backend::BackendOptions;
     use rustic_core::{
         BackupOptions,
@@ -310,9 +341,9 @@ fn run_rustic_backup(source: &Path, repository: &str, password: String) -> Resul
         .to_str()
         .ok_or_else(|| anyhow!("backup staging path is not valid UTF-8"))?;
     let source = PathList::from_string(source)?.sanitize()?;
-    let snapshot = SnapshotOptions::default()
-        .add_tags(RESTIC_TAG)?
-        .to_snapshot()?;
+    let mut snapshot_opts = SnapshotOptions::default().add_tags(RESTIC_TAG)?;
+    snapshot_opts.host = host;
+    let snapshot = snapshot_opts.to_snapshot()?;
 
     info!("starting restic snapshot creation");
     let snapshot = repo.backup(&backup_opts, &source, snapshot)?;

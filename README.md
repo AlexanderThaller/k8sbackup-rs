@@ -29,6 +29,11 @@ The restic repository can also be passed with `--restic-repository`; the
 repository password can be passed with `--restic-password`,
 `K8SBACKUP_RESTIC_PASSWORD`, or `RESTIC_PASSWORD`.
 
+The host name recorded in the snapshot can be set with `--restic-host`,
+`K8SBACKUP_RESTIC_HOST`, or `RESTIC_HOST`. It defaults to the system host name,
+which inside a Kubernetes pod changes on every run; set it to a stable value so
+host-scoped `restic forget` policies work.
+
 ## Build
 
 Build an optimized local binary:
@@ -76,6 +81,13 @@ Required environment variables:
 
 - `K8SBACKUP_RESTIC_REPOSITORY`
 - `K8SBACKUP_RESTIC_PASSWORD`
+
+Optional:
+
+- `K8SBACKUP_RESTIC_HOST` — set as a plain `env` entry in
+  `kubernetes/cronjob.yaml` (default `k8sbackup`). Without it, every run records
+  the pod host name as the snapshot host. Because it is set with `env` it takes
+  precedence over the same key in the `k8sbackup-restic` secret.
 
 The CronJob runs daily at `02:17` in the `k8sbackup` namespace. The image is set
 to `k8sbackup-rs:latest`; override it with kustomize for your registry.

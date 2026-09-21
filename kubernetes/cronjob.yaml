@@ -21,6 +21,13 @@ spec:
               args:
                 - --backup-type
                 - restic
+              env:
+                # Host name recorded in the restic snapshot. Without it every
+                # run records the pod host name, which breaks host-scoped
+                # `restic forget` policies. Takes precedence over the same key
+                # in the k8sbackup-restic secret.
+                - name: K8SBACKUP_RESTIC_HOST
+                  value: k8sbackup
               envFrom:
                 - secretRef:
                     name: k8sbackup-restic
