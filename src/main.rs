@@ -165,9 +165,7 @@ impl AgeEncryption {
         )
         .context("creating age encryptor")?;
 
-        encryptor
-            .wrap_output(writer)
-            .context("writing age header")
+        encryptor.wrap_output(writer).context("writing age header")
     }
 }
 
@@ -723,10 +721,7 @@ mod tests {
 
         let written: Value = serde_yaml::from_str(&yaml)?;
 
-        assert_eq!(
-            written.get("kind").and_then(Value::as_str),
-            Some("Secret")
-        );
+        assert_eq!(written.get("kind").and_then(Value::as_str), Some("Secret"));
         assert_eq!(
             written
                 .get("data")
