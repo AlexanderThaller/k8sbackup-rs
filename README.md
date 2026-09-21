@@ -34,6 +34,42 @@ The host name recorded in the snapshot can be set with `--restic-host`,
 which inside a Kubernetes pod changes on every run; set it to a stable value so
 host-scoped `restic forget` policies work.
 
+## Encryption
+
+The dumped YAML files can be encrypted with [age](https://age-encryption.org)
+before they are written, so that neither the local folder nor the restic
+repository ever holds plaintext Kubernetes objects (Secrets included):
+
+```sh
+age-keygen -o k8sbackup-key.txt
+age-keygen -y k8sbackup-key.txt   # the public key to pass below
+
+cargo run -- \
+  --backup-type folder \
+  --output backup \
+  --age-recipient age1...
+```
+
+Encrypted objects are written as `<name>.yaml.age` instead of `<name>.yaml` and
+are decrypted with the standard age tooling:
+
+```sh
+age --decrypt --identity k8sbackup-key.txt backup/default/ConfigMap-v1/example.yaml.age
+```
+
+`--age-recipient` can be repeated to encrypt for several recipients, and can be
+set with `K8SBACKUP_AGE_RECIPIENT` (comma-separated for multiple keys). Public
+keys are parsed at startup, so an invalid key fails before anything is dumped.
+
+Keep the identity file out of the cluster being backed up: the backup cannot be
+restored without it.
+
+Note the trade-off when combining age with `--backup-type restic`: age uses a
+fresh random file key per file, so an unchanged object encrypts to different
+bytes on every run. Restic deduplication and compression therefore stop helping
+and each snapshot stores the full backup again. Restic already encrypts the
+repository, so this is mainly worth it when the repository itself is untrusted.
+
 ## Build
 
 Build an optimized local binary:
@@ -84,6 +120,9 @@ Required environment variables:
 
 Optional:
 
+- `K8SBACKUP_AGE_RECIPIENT` — age public key(s) to encrypt the dumped YAML files
+  with, see [Encryption](#encryption). Not a secret, so it can be set as a plain
+  `env` entry in `kubernetes/cronjob.yaml`.
 - `K8SBACKUP_RESTIC_HOST` — set as a plain `env` entry in
   `kubernetes/cronjob.yaml` (default `k8sbackup`). Without it, every run records
   the pod host name as the snapshot host. Because it is set with `env` it takes

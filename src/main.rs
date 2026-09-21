@@ -6,14 +6,23 @@
 //! that cannot be listed and fetched, and writes one YAML file per object.
 
 use std::{
+    fmt,
     fs,
-    io::BufWriter,
+    io::{
+        BufWriter,
+        Write,
+    },
     path::{
         Path,
         PathBuf,
     },
 };
 
+use age::{
+    Encryptor,
+    stream::StreamWriter,
+    x25519,
+};
 use anyhow::{
     Context,
     Result,
@@ -48,11 +57,13 @@ use tracing::{
     warn,
 };
 use tracing_subscriber::EnvFilter;
+const AGE_FILE_EXTENSION: &str = "yaml.age";
 const GLOBAL_NAMESPACE: &str = "_global";
 const KUBERNETES_LIST_PAGE_SIZE: u32 = 100;
 const RESTIC_COMPRESSION_LEVEL: i32 = 1;
 const RESTIC_SNAPSHOT_PATH: &str = "k8sbackup";
 const RESTIC_TAG: &str = "k8sbackup";
+const YAML_FILE_EXTENSION: &str = "yaml";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -97,6 +108,67 @@ struct Args {
         value_name = "NAME"
     )]
     restic_host: Option<String>,
+
+    /// age public key to encrypt the dumped YAML files with.
+    ///
+    /// Can be repeated to encrypt for several recipients. Also accepts a
+    /// comma-separated list, which is how `K8SBACKUP_AGE_RECIPIENT` passes
+    /// multiple keys. Encrypted files are written as `<name>.yaml.age` and can
+    /// be decrypted with `age --decrypt --identity <key-file>`.
+    #[arg(
+        long = "age-recipient",
+        env = "K8SBACKUP_AGE_RECIPIENT",
+        value_name = "PUBLIC_KEY",
+        value_delimiter = ','
+    )]
+    age_recipient: Vec<String>,
+}
+
+/// The age recipients that dumped YAML files are encrypted for.
+struct AgeEncryption {
+    recipients: Vec<x25519::Recipient>,
+}
+
+impl fmt::Debug for AgeEncryption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgeEncryption")
+            .field("recipients", &self.recipients.len())
+            .finish()
+    }
+}
+
+impl AgeEncryption {
+    /// Parses age public keys, failing before any object is dumped.
+    fn new(keys: &[String]) -> Result<Self> {
+        let recipients = keys
+            .iter()
+            .map(|key| {
+                key.parse::<x25519::Recipient>()
+                    .map_err(|err| anyhow!("parsing age recipient {key}: {err}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if recipients.is_empty() {
+            bail!("at least one age recipient is required");
+        }
+
+        Ok(Self { recipients })
+    }
+
+    /// Wraps a writer so everything written to it is age encrypted.
+    fn wrap<W: Write>(&self, writer: W) -> Result<StreamWriter<W>> {
+        let encryptor = Encryptor::with_recipients(
+            self.recipients
+                .iter()
+                .map(|recipient| recipient as &dyn age::Recipient),
+        )
+        .context("creating age encryptor")?;
+
+        encryptor
+            .wrap_output(writer)
+            .context("writing age header")
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -119,9 +191,21 @@ async fn main() -> Result<()> {
         .await
         .context("creating Kubernetes client from local kubeconfig or in-cluster config")?;
 
+    let encryption = if args.age_recipient.is_empty() {
+        None
+    } else {
+        let encryption = AgeEncryption::new(&args.age_recipient)?;
+        info!(
+            recipients = encryption.recipients.len(),
+            "encrypting backup files with age"
+        );
+        Some(encryption)
+    };
+    let encryption = encryption.as_ref();
+
     match args.backup_type {
         BackupType::Folder => {
-            let written = dump_cluster(&client, &args.output).await?;
+            let written = dump_cluster(&client, &args.output, encryption).await?;
             info!(
                 written,
                 output = %args.output.display(),
@@ -134,7 +218,8 @@ async fn main() -> Result<()> {
             })?;
             let password = restic_password(args.restic_password)?;
             let host = restic_host(args.restic_host);
-            let written = write_restic_backup(&client, repository, password, host).await?;
+            let written =
+                write_restic_backup(&client, repository, password, host, encryption).await?;
             info!(
                 written,
                 repository = %censor_repository_password(repository),
@@ -157,8 +242,12 @@ fn init_tracing() {
         .init();
 }
 
-#[instrument(skip(client), fields(output = %output.display()))]
-async fn dump_cluster(client: &Client, output: &Path) -> Result<usize> {
+#[instrument(skip(client, encryption), fields(output = %output.display()))]
+async fn dump_cluster(
+    client: &Client,
+    output: &Path,
+    encryption: Option<&AgeEncryption>,
+) -> Result<usize> {
     info!("starting cluster dump");
 
     fs::create_dir_all(output)
@@ -179,7 +268,7 @@ async fn dump_cluster(client: &Client, output: &Path) -> Result<usize> {
                 continue;
             }
 
-            match dump_resource(client, &resource, &capabilities, output).await {
+            match dump_resource(client, &resource, &capabilities, output, encryption).await {
                 Ok(count) => written += count,
                 Err(err) => {
                     warn!(
@@ -239,6 +328,7 @@ async fn write_restic_backup(
     repository: &str,
     password: String,
     host: Option<String>,
+    encryption: Option<&AgeEncryption>,
 ) -> Result<usize> {
     let staging = std::env::temp_dir().join(format!("k8sbackup-{}", uuid::Uuid::now_v7()));
     let censored_repository = censor_repository_password(repository);
@@ -251,7 +341,7 @@ async fn write_restic_backup(
     );
 
     let result = async {
-        let written = dump_cluster(client, &staging).await?;
+        let written = dump_cluster(client, &staging, encryption).await?;
         let source = staging.clone();
         let repository = repository.to_string();
 
@@ -359,7 +449,7 @@ fn run_rustic_backup(
 }
 
 #[instrument(
-    skip(client, capabilities, output),
+    skip(client, capabilities, output, encryption),
     fields(api_version = %resource.api_version, kind = %resource.kind)
 )]
 async fn dump_resource(
@@ -367,6 +457,7 @@ async fn dump_resource(
     resource: &ApiResource,
     capabilities: &ApiCapabilities,
     output: &Path,
+    encryption: Option<&AgeEncryption>,
 ) -> Result<usize> {
     debug!("starting resource dump");
 
@@ -395,7 +486,12 @@ async fn dump_resource(
                 })?,
             };
 
-            let filename = format!("{}.yaml", safe_path_segment(&object.name_any()));
+            let extension = if encryption.is_some() {
+                AGE_FILE_EXTENSION
+            } else {
+                YAML_FILE_EXTENSION
+            };
+            let filename = format!("{}.{extension}", safe_path_segment(&object.name_any()));
             let resource_dir = format!(
                 "{}-{}",
                 safe_path_segment(&resource.kind),
@@ -406,7 +502,8 @@ async fn dump_resource(
                 .join(resource_dir)
                 .join(filename);
 
-            write_object(&path, &object).with_context(|| format!("writing {}", path.display()))?;
+            write_object(&path, &object, encryption)
+                .with_context(|| format!("writing {}", path.display()))?;
             count += 1;
         }
 
@@ -425,14 +522,28 @@ async fn dump_resource(
     Ok(count)
 }
 
-fn write_object(path: &Path, object: &DynamicObject) -> Result<()> {
+fn write_object(
+    path: &Path,
+    object: &DynamicObject,
+    encryption: Option<&AgeEncryption>,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)?;
 
-    let file = fs::File::create(path)?;
-    serde_yaml::to_writer(BufWriter::new(file), object)?;
+    let mut writer = BufWriter::new(fs::File::create(path)?);
+
+    match encryption {
+        None => serde_yaml::to_writer(&mut writer, object)?,
+        Some(encryption) => {
+            let mut encrypted = encryption.wrap(&mut writer)?;
+            serde_yaml::to_writer(&mut encrypted, object)?;
+            encrypted.finish().context("finishing age stream")?;
+        }
+    }
+
+    writer.flush()?;
 
     Ok(())
 }
@@ -562,6 +673,83 @@ mod tests {
     }
 
     #[test]
+    fn write_object_encrypts_for_age_recipient() -> Result<()> {
+        use std::io::Read;
+
+        let identity = x25519::Identity::generate();
+        let encryption = AgeEncryption::new(&[identity.to_public().to_string()])?;
+
+        let path = std::env::temp_dir().join(format!(
+            "k8sbackup-rs-{}.{AGE_FILE_EXTENSION}",
+            uuid::Uuid::now_v7()
+        ));
+        let object = DynamicObject {
+            types: Some(TypeMeta {
+                api_version: "v1".to_string(),
+                kind: "Secret".to_string(),
+            }),
+            metadata: ObjectMeta {
+                name: Some("example".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            data: json!({
+                "data": {
+                    "token": "c3VwZXItc2VjcmV0",
+                },
+            }),
+        };
+
+        write_object(&path, &object, Some(&encryption))?;
+
+        let encrypted = fs::read(&path)?;
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            encrypted.starts_with(b"age-encryption.org/v1"),
+            "file is not an age encrypted file"
+        );
+        assert!(
+            !encrypted
+                .windows("c3VwZXItc2VjcmV0".len())
+                .any(|window| window == b"c3VwZXItc2VjcmV0"),
+            "plaintext secret leaked into the encrypted file"
+        );
+
+        let decryptor = age::Decryptor::new_buffered(encrypted.as_slice())?;
+        let mut reader = decryptor.decrypt(std::iter::once(&identity as &dyn age::Identity))?;
+        let mut yaml = String::new();
+        reader.read_to_string(&mut yaml)?;
+
+        let written: Value = serde_yaml::from_str(&yaml)?;
+
+        assert_eq!(
+            written.get("kind").and_then(Value::as_str),
+            Some("Secret")
+        );
+        assert_eq!(
+            written
+                .get("data")
+                .and_then(|data| data.get("token"))
+                .and_then(Value::as_str),
+            Some("c3VwZXItc2VjcmV0")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn age_encryption_rejects_invalid_recipient() {
+        let error = AgeEncryption::new(&["not-an-age-key".to_string()])
+            .expect_err("invalid recipient was accepted");
+
+        assert!(
+            error.to_string().contains("not-an-age-key"),
+            "error did not mention the offending key: {error}"
+        );
+    }
+
+    #[test]
     fn censor_repository_password_masks_rest_backend_password() {
         let repository =
             "rest:https://imap-chatbot-k8sbackup:secret@restic.thaller.ws/imap-chatbot-k8sbackup";
@@ -607,7 +795,7 @@ mod tests {
             }),
         };
 
-        write_object(&path, &object)?;
+        write_object(&path, &object, None)?;
 
         let yaml = fs::read_to_string(&path)?;
         let written: Value = serde_yaml::from_str(&yaml)?;
