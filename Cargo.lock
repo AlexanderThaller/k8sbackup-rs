@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "k8sbackup-rs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "age",
  "anyhow",

@@ -1,6 +1,6 @@
 [package]
 name = "k8sbackup-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
 description = "Backs up Kubernetes API objects as restore-friendly YAML files, optionally storing them in a restic-compatible repository."
